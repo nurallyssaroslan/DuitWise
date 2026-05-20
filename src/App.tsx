@@ -18,9 +18,10 @@ import RecordExpense from './components/RecordExpense';
 import ExpenseList from './components/ExpenseList';
 
 import { Expense, AllowanceSetup, UserSession, SurvivalMetrics, SurvivalStatus } from './types';
+import { supabase } from './lib/supabase';
 
 export default function App() {
-  // Primary session states loaded from local storage
+  // Primary session states
   const [session, setSession] = useState<UserSession>({
     email: null,
     isLoggedIn: false,
@@ -37,120 +38,193 @@ export default function App() {
   const [viewingAuth, setViewingAuth] = useState(false);
   const [activeSubPage, setActiveSubPage] = useState<'dashboard' | 'record' | 'ledger'>('dashboard');
   const [showFaq, setShowFaq] = useState(false);
+  const [loadingProfile, setLoadingProfile] = useState<boolean>(true);
 
-  // Load from local storage on mount
+  // Core function to load of session-related profile parameters from database
+  const fetchAndSyncProfile = async () => {
+    setLoadingProfile(true);
+    try {
+      const { data: { user }, error: userError } = await supabase.auth.getUser();
+      if (userError || !user) {
+        setSession({
+          email: null,
+          isLoggedIn: false,
+          hasCompletedSetup: false,
+        });
+        setLoadingProfile(false);
+        return;
+      }
+
+      const userEmail = user.email || '';
+
+      const { data, error: profileError } = await supabase
+        .from('profiles')
+        .select('initial_balance, next_allowance_date, setup_date')
+        .eq('user_id', user.id);
+
+      if (profileError) {
+        console.error('Error loading Supabase profile:', profileError.message);
+        setSession({
+          email: userEmail,
+          isLoggedIn: true,
+          hasCompletedSetup: false,
+        });
+      } else if (data && data.length > 0) {
+        const prof = data[0];
+        setSetup({
+          initialBalance: Number(prof.initial_balance) || 0,
+          nextAllowanceDate: prof.next_allowance_date || '',
+        });
+        setSetupDate(prof.setup_date || '');
+        setSession({
+          email: userEmail,
+          isLoggedIn: true,
+          hasCompletedSetup: true,
+        });
+      } else {
+        setSession({
+          email: userEmail,
+          isLoggedIn: true,
+          hasCompletedSetup: false,
+        });
+      }
+    } catch (err: any) {
+      console.error('Unexpected error during profile sync:', err?.message || err);
+    } finally {
+      setLoadingProfile(false);
+    }
+  };
+
+  // Sync Supabase auth session and profile on mount
   useEffect(() => {
-    const savedSession = localStorage.getItem('duitwise_session');
-    const savedSetup = localStorage.getItem('duitwise_setup');
-    const savedSetupDate = localStorage.getItem('duitwise_setup_date');
-    const savedExpenses = localStorage.getItem('duitwise_expenses');
+    fetchAndSyncProfile();
 
-    if (savedSession) {
-      setSession(JSON.parse(savedSession));
-    }
-    if (savedSetup) {
-      setSetup(JSON.parse(savedSetup));
-    }
-    if (savedSetupDate) {
-      setSetupDate(savedSetupDate);
-    }
+    // Listen to changes in auth state dynamically
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, activeSession) => {
+      if (event === 'SIGNED_IN') {
+        fetchAndSyncProfile();
+      } else if (event === 'SIGNED_OUT') {
+        setSession({
+          email: null,
+          isLoggedIn: false,
+          hasCompletedSetup: false,
+        });
+        setSetup({ initialBalance: 0, nextAllowanceDate: '' });
+        setSetupDate('');
+      }
+    });
+
+    const savedExpenses = localStorage.getItem('duitwise_expenses');
     if (savedExpenses) {
       setExpenses(JSON.parse(savedExpenses));
     }
+
+    return () => {
+      subscription.unsubscribe();
+    };
   }, []);
 
-  // Save to local storage when state changes
-  const saveSessionToStorage = (newSession: UserSession) => {
-    setSession(newSession);
-    localStorage.setItem('duitwise_session', JSON.stringify(newSession));
-  };
-
   const handleLoginSuccess = (email: string) => {
-    const newSession = {
+    setSession({
       email,
       isLoggedIn: true,
-      hasCompletedSetup: localStorage.getItem('duitwise_setup') !== null,
-    };
-    saveSessionToStorage(newSession);
+      hasCompletedSetup: false,
+    });
     setViewingAuth(false);
+    fetchAndSyncProfile();
   };
 
-  const handleLogout = () => {
-    const newSession = {
+  const handleLogout = async () => {
+    try {
+      await supabase.auth.signOut();
+    } catch (err) {
+      console.warn('Error during Supabase signout', err);
+    }
+    setSession({
       email: null,
       isLoggedIn: false,
       hasCompletedSetup: false,
-    };
-    saveSessionToStorage(newSession);
+    });
     setActiveSubPage('dashboard');
   };
 
   // Completely resets simulation parameters to try a different balance or date
-  const handleResetSimulation = () => {
+  const handleResetSimulation = async () => {
     if (window.confirm('Are you sure you want to completely erase the current pocket allowance setup and logged expenses?')) {
-      localStorage.removeItem('duitwise_setup');
-      localStorage.removeItem('duitwise_setup_date');
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (user) {
+          const { error } = await supabase
+            .from('profiles')
+            .delete()
+            .eq('user_id', user.id);
+          if (error) {
+            console.error('Error deleting profile during simulation reset:', error.message);
+          }
+        }
+      } catch (err: any) {
+        console.error('Unexpected error deleting profile during reset:', err?.message || err);
+      }
+
       localStorage.removeItem('duitwise_expenses');
       
       setSetup({ initialBalance: 0, nextAllowanceDate: '' });
       setSetupDate('');
       setExpenses([]);
       
-      const updatedSession = { ...session, hasCompletedSetup: false };
-      saveSessionToStorage(updatedSession);
+      setSession({
+        email: session.email,
+        isLoggedIn: true,
+        hasCompletedSetup: false,
+      });
       setActiveSubPage('dashboard');
     }
   };
 
-  const handleSetupSave = (balance: number, nextAllowanceDate: string) => {
+  const handleSetupSave = async (balance: number, nextAllowanceDate: string) => {
     const today = new Date();
     const todayStr = today.toISOString().split('T')[0];
 
-    const newSetup = {
-      initialBalance: balance,
-      nextAllowanceDate,
-    };
-
-    setSetup(newSetup);
-    setSetupDate(todayStr);
-    
-    // Create pre-populated initial demonstration expenses to showcase budget status right away!
-    const demonstrationExpenses: Expense[] = [
-      {
-        id: '1',
-        amount: 8.50,
-        category: 'food',
-        description: 'Hostel Canteen lunch',
-        date: todayStr
-      },
-      {
-        id: '2',
-        amount: 32.00,
-        category: 'study',
-        description: 'Programming reference booklet printout',
-        date: todayStr
-      },
-      {
-        id: '3',
-        amount: 4.00,
-        category: 'transport',
-        description: 'LRT single fare ticket',
-        date: todayStr
+    try {
+      const { data: { user }, error: userError } = await supabase.auth.getUser();
+      if (userError || !user) {
+        console.error('Failed to save setup: No authenticated user found.', userError);
+        return;
       }
-    ];
 
-    setExpenses(demonstrationExpenses);
+      const { error: saveError } = await supabase
+        .from('profiles')
+        .upsert({
+          user_id: user.id,
+          initial_balance: balance,
+          next_allowance_date: nextAllowanceDate,
+          setup_date: todayStr
+        });
 
-    localStorage.setItem('duitwise_setup', JSON.stringify(newSetup));
-    localStorage.setItem('duitwise_setup_date', todayStr);
-    localStorage.setItem('duitwise_expenses', JSON.stringify(demonstrationExpenses));
+      if (saveError) {
+        console.error('Error saving profile to Supabase profiles table:', saveError.message);
+        alert(`Error saving setup: ${saveError.message}`);
+        return;
+      }
 
-    const updatedSession = {
-      ...session,
-      hasCompletedSetup: true,
-    };
-    saveSessionToStorage(updatedSession);
-    setActiveSubPage('dashboard');
+      const newSetup = {
+        initialBalance: balance,
+        nextAllowanceDate,
+      };
+
+      setSetup(newSetup);
+      setSetupDate(todayStr);
+
+      setSession({
+        email: user.email || session.email,
+        isLoggedIn: true,
+        hasCompletedSetup: true,
+      });
+      setActiveSubPage('dashboard');
+
+    } catch (err: any) {
+      console.error('Unexpected error during setup save:', err?.message || err);
+    }
   };
 
   // Expense handlers
@@ -165,22 +239,55 @@ export default function App() {
     setActiveSubPage('dashboard');
   };
 
-  const handleAddMoney = (amount: number) => {
+  const handleAddMoney = async (amount: number) => {
     const updatedSetup = {
       ...setup,
       initialBalance: setup.initialBalance + amount,
     };
     setSetup(updatedSetup);
-    localStorage.setItem('duitwise_setup', JSON.stringify(updatedSetup));
+
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        const { error } = await supabase
+          .from('profiles')
+          .update({
+            initial_balance: updatedSetup.initialBalance
+          })
+          .eq('user_id', user.id);
+        if (error) {
+          console.error('Error updating initial_balance in Supabase:', error.message);
+        }
+      }
+    } catch (err: any) {
+      console.error('Unexpected error during adding money:', err?.message || err);
+    }
   };
 
-  const handleUpdateSetup = (newBalance: number, newDate: string) => {
+  const handleUpdateSetup = async (newBalance: number, newDate: string) => {
     const updatedSetup = {
       initialBalance: newBalance,
       nextAllowanceDate: newDate,
     };
     setSetup(updatedSetup);
-    localStorage.setItem('duitwise_setup', JSON.stringify(updatedSetup));
+
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        const { error } = await supabase
+          .from('profiles')
+          .update({
+            initial_balance: newBalance,
+            next_allowance_date: newDate
+          })
+          .eq('user_id', user.id);
+        if (error) {
+          console.error('Error updating profile setup in Supabase:', error.message);
+        }
+      }
+    } catch (err: any) {
+      console.error('Unexpected error during updating setup:', err?.message || err);
+    }
   };
 
   const handleDeleteExpense = (id: string) => {
@@ -251,6 +358,19 @@ export default function App() {
   const metrics = computeSurvivalMetrics();
 
   // Rendering routing states
+  if (loadingProfile) {
+    return (
+      <div id="loading-profile-screen" className="min-h-screen bg-[#fdfcf8] text-[#3d3d33] flex flex-col items-center justify-center font-sans">
+        <div className="flex flex-col items-center gap-4">
+          <div className="p-3.5 bg-[#5A5A40] rounded-xl text-white animate-spin">
+            <RefreshCw size={24} />
+          </div>
+          <span className="text-xs font-bold font-mono text-[#5A5A40] tracking-wider uppercase">Loading survival cache...</span>
+        </div>
+      </div>
+    );
+  }
+
   if (!session.isLoggedIn) {
     if (viewingAuth) {
       return (
@@ -444,7 +564,7 @@ export default function App() {
               <div className="space-y-1">
                 <h4 className="font-bold text-[#3d3d33]">Is Supabase/Database saving securely?</h4>
                 <p className="leading-relaxed">
-                  Currently, DuitWise Snap saves your records instantly within your local browser cache. Rest assured that no cloud transmission is active, making testing completely private. A real Supabase layer can be hooked up seamlessly in matching parameters later!
+                  Your profile configuration data is fully connected and saved to Supabase profiles database table. To protect privacy on standard college food tracks, individual logged expenses continue to be stored safely in local sandbox storage.
                 </p>
               </div>
             </div>
@@ -456,7 +576,7 @@ export default function App() {
       {/* Footer copyright with Natural Tones details */}
       <footer className="bg-white border-t border-[#e5e5d1] py-6 px-6 text-center text-xs text-[#8a8a7a]">
         <div className="max-w-7xl mx-auto flex flex-col sm:flex-row justify-between items-center gap-4">
-          <p>© 2026 DuitWise Snap Tracker. All financial parameters are sandboxed in regional memory state.</p>
+          <p>© 2026 DuitWise Snap Tracker. Setup profiles are securely synced with cloud databases.</p>
           <p className="font-mono text-[10px] text-[#8a8a7a] mt-1 sm:mt-0">
             Natural Tones Typographic Theme (Plus Jakarta Sans & Playfair Display Stack)
           </p>
