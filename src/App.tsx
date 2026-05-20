@@ -95,6 +95,26 @@ export default function App() {
     }
   };
 
+  // Fetch expenses from Supabase
+  const fetchExpenses = async (userId: string) => {
+    try {
+      const { data, error } = await supabase
+        .from('expenses')
+        .select('id, amount, category, description, date')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error('Error fetching expenses from Supabase:', error.message);
+        setExpenses([]);
+      } else if (data) {
+        setExpenses(data as Expense[]);
+      }
+    } catch (err: any) {
+      console.error('Unexpected error fetching expenses:', err?.message || err);
+    }
+  };
+
   // Sync Supabase auth session and profile on mount
   useEffect(() => {
     fetchAndSyncProfile();
@@ -114,10 +134,14 @@ export default function App() {
       }
     });
 
-    const savedExpenses = localStorage.getItem('duitwise_expenses');
-    if (savedExpenses) {
-      setExpenses(JSON.parse(savedExpenses));
-    }
+    // Fetch expenses from Supabase for authenticated user
+    const loadExpenses = async () => {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        await fetchExpenses(user.id);
+      }
+    };
+    loadExpenses();
 
     return () => {
       subscription.unsubscribe();
@@ -166,8 +190,6 @@ export default function App() {
         console.error('Unexpected error deleting profile during reset:', err?.message || err);
       }
 
-      localStorage.removeItem('duitwise_expenses');
-      
       setSetup({ initialBalance: 0, nextAllowanceDate: '' });
       setSetupDate('');
       setExpenses([]);
@@ -228,15 +250,46 @@ export default function App() {
   };
 
   // Expense handlers
-  const handleAddExpense = (newExp: Omit<Expense, 'id'>) => {
-    const withId: Expense = {
-      ...newExp,
-      id: Math.random().toString(36).substring(2, 9),
-    };
-    const updated = [withId, ...expenses];
-    setExpenses(updated);
-    localStorage.setItem('duitwise_expenses', JSON.stringify(updated));
-    setActiveSubPage('dashboard');
+  const handleAddExpense = async (newExp: Omit<Expense, 'id'>) => {
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) {
+        console.error('No authenticated user found');
+        return;
+      }
+
+      const { data, error } = await supabase
+        .from('expenses')
+        .insert({
+          user_id: user.id,
+          amount: newExp.amount,
+          category: newExp.category,
+          description: newExp.description,
+          date: newExp.date,
+        })
+        .select('id, amount, category, description, date')
+        .single();
+
+      if (error) {
+        console.error('Error inserting expense into Supabase:', error.message);
+        return;
+      }
+
+      if (data) {
+        const withId: Expense = {
+          id: data.id,
+          amount: data.amount,
+          category: data.category,
+          description: data.description,
+          date: data.date,
+        };
+        const updated = [withId, ...expenses];
+        setExpenses(updated);
+        setActiveSubPage('dashboard');
+      }
+    } catch (err: any) {
+      console.error('Unexpected error adding expense:', err?.message || err);
+    }
   };
 
   const handleAddMoney = async (amount: number) => {
@@ -290,10 +343,30 @@ export default function App() {
     }
   };
 
-  const handleDeleteExpense = (id: string) => {
-    const updated = expenses.filter(exp => exp.id !== id);
-    setExpenses(updated);
-    localStorage.setItem('duitwise_expenses', JSON.stringify(updated));
+  const handleDeleteExpense = async (id: string) => {
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) {
+        console.error('No authenticated user found');
+        return;
+      }
+
+      const { error } = await supabase
+        .from('expenses')
+        .delete()
+        .eq('id', id)
+        .eq('user_id', user.id);
+
+      if (error) {
+        console.error('Error deleting expense from Supabase:', error.message);
+        return;
+      }
+
+      const updated = expenses.filter(exp => exp.id !== id);
+      setExpenses(updated);
+    } catch (err: any) {
+      console.error('Unexpected error deleting expense:', err?.message || err);
+    }
   };
 
   // CORE METRIC CALCULATOR ENGINE
