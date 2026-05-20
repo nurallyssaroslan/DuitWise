@@ -1,0 +1,6 @@
+{
+  "name": "DuitWise Snap",
+  "description": "A student allowance survival tracker to monitor balances, see days until next allowance, calculate safe daily limits, and track categories.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
